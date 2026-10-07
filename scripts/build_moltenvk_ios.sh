@@ -17,7 +17,15 @@ if [ ! -d "$SRC" ]; then
 fi
 cd "$SRC"
 [ -d External/build/Release/SPIRVCross.xcframework ] || { echo "==> fetching dependencies"; ./fetchDependencies --ios; }
-echo "==> building"
+# MoltenVK picks its own deployment target otherwise, and `make ios` offers no
+# flag for it. xcodebuild reads build settings from the environment, which is
+# how this reaches the framework it produces -- and it has to, because an
+# xcframework built higher than the app gets embedded, signed and shipped, and
+# is then refused by dyld the first time an Unreal game asks for Vulkan.
+# scripts/check_min_ios.sh is what catches it if this ever stops working.
+export IPHONEOS_DEPLOYMENT_TARGET="${HUSK_MIN_IOS:-16.4}"
+
+echo "==> building for iOS $IPHONEOS_DEPLOYMENT_TARGET"
 make ios
 mkdir -p "$OUT"
 rm -rf "$OUT/MoltenVK.xcframework"

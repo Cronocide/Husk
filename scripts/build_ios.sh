@@ -19,7 +19,10 @@ mkdir -p "$PREFIX" "$LOGS" "$STAMPS"
 
 ARCH=arm64
 SDK=iphoneos
-SDKMINVER="${SDKMINVER:-16.0}"
+# HUSK_MIN_IOS is the one knob for the whole native stack: this script, ANGLE,
+# MoltenVK and the Rust pairing crate all read it, so the app and everything
+# it embeds move together. SDKMINVER still wins if it is set explicitly.
+SDKMINVER="${SDKMINVER:-${HUSK_MIN_IOS:-16.0}}"
 NCPU="$(sysctl -n hw.ncpu)"
 
 SDKROOT="$(xcrun --sdk $SDK --show-sdk-path)"

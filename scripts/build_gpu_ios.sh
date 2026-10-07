@@ -18,8 +18,19 @@ HUSK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GPU="$HUSK_ROOT/third_party/gpu"
 PREFIX="$HUSK_ROOT/build/ios-arm64/sysroot"
 LOGS="$HUSK_ROOT/build/logs"
-MESON=/opt/homebrew/bin/meson
-NINJA=/opt/homebrew/bin/ninja
+# Found on PATH, not hardcoded. These were /opt/homebrew/bin/..., which is the
+# Apple Silicon Homebrew prefix: on an Intel Mac brew lives in /usr/local and
+# this script failed with "No such file or directory" for meson, several hours
+# into a clean build. The self-hosted runner this is built on is an Intel Mac.
+MESON="${MESON:-$(command -v meson || true)}"
+NINJA="${NINJA:-$(command -v ninja || true)}"
+for t in MESON NINJA; do
+    if [ -z "${!t}" ]; then
+        echo "error: $(echo "$t" | tr 'A-Z' 'a-z') not found on PATH." >&2
+        echo "       brew install meson ninja" >&2
+        exit 1
+    fi
+done
 mkdir -p "$GPU" "$LOGS"
 
 EPOXY_COMMIT=bf98587477fe68d07b93319ece7b40a7d0e2eabe

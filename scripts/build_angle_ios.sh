@@ -45,6 +45,23 @@ cd "$WK/Source/ThirdParty/ANGLE"
 # was 17.0 while Husk itself required 17.0; Husk now deploys to 16.4, and
 # building ANGLE any higher than the app produces a dylib dyld refuses to load
 # on the oldest supported OS.
+# 16.4 is a floor here, not a preference, and it is the one place the iOS 16
+# port cannot simply follow HUSK_MIN_IOS down. With the availability overlay
+# cleared (above), ANGLE's Metal backend references MTLPixelFormatBC1_RGBA and
+# its siblings, which Apple introduced in iOS 16.4 -- below that the build
+# fails outright rather than producing something that merely misbehaves.
+#
+# So this clamps instead of failing: Husk deploys to 16.4 today, which matches,
+# and if the app floor is ever lowered the GL stack stays where it compiles and
+# Emulation is simply gated to 16.4+. The Translation Layer does not go through
+# ANGLE and is unaffected.
+ANGLE_MIN_IOS="${HUSK_MIN_IOS:-16.4}"
+if [ "$(printf '%s\n16.4\n' "$ANGLE_MIN_IOS" | sort -V | head -1)" = "$ANGLE_MIN_IOS" ] \
+   && [ "$ANGLE_MIN_IOS" != "16.4" ]; then
+    echo "==> ANGLE needs iOS 16.4 (MTLPixelFormatBC1_RGBA); building at 16.4, not $ANGLE_MIN_IOS" >&2
+    ANGLE_MIN_IOS=16.4
+fi
+
 ALIASES="$GPU/angle-aliases.txt"
 
 angle_build () {
@@ -67,7 +84,7 @@ angle_build () {
         WEBCORE_LIBRARY_DIR="/usr/local/lib" NORMAL_UMBRELLA_FRAMEWORKS_DIR="" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
         WK_AVAILABILITY_OVERLAY_FLAGS="" WK_AVAILABILITY_OVERLAY_SWIFT_FLAGS="" \
-        IPHONEOS_DEPLOYMENT_TARGET="16.4" \
+        IPHONEOS_DEPLOYMENT_TARGET="$ANGLE_MIN_IOS" \
         ${ldflags[@]+"${ldflags[@]}"} \
         > "$LOG" 2>&1 \
       || { echo "ANGLE build failed; last errors:" >&2

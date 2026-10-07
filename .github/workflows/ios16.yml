@@ -1,0 +1,287 @@
+name: Build (iOS 16)
+
+# One workflow, one runner, one device build, on the self-hosted Mac.
+#
+# Modelled on halite-agent's ci.yml, with the differences Husk forces:
+#
+#   * No simulator and no test step. Husk links a QEMU dylib and an ANGLE dylib
+#     built for iphoneos only, so there is nothing a simulator can run.
+#   * No linters. There is no .swiftlint.yml or .swiftformat in this repo, so a
+#     lint step would either pass vacuously or invent a house style.
+#   * `clean: false` on the checkout, which matters more here than anything
+#     else in this file. See the Checkout step.
+#
+# Nothing starts on its own:
+#
+#     gh workflow run "Build (iOS 16)"                   # build and attach the IPA
+#     gh workflow run "Build (iOS 16)" -f release=true   # ...and publish a prerelease
+#
+# or by pushing an ios16-v* tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Also publish the IPA as a prerelease"
+        type: boolean
+        default: false
+      deployment_target:
+        description: "iOS deployment target for the app and everything it embeds"
+        type: string
+        default: "16.4"
+      rebuild_deps:
+        description: "Rebuild QEMU, ANGLE and MoltenVK from scratch (hours)"
+        type: boolean
+        default: false
+  push:
+    tags: ["ios16-v*"]
+
+concurrency:
+  # One Mac, one QEMU tree, one set of build stamps. Two runs of this workflow
+  # in the same tree would race in third_party/build and produce a dylib
+  # neither of them describes.
+  group: husk-ios16-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for iOS 16
+    # The owner's Mac. It needs Xcode, Homebrew, and a Rust toolchain with the
+    # aarch64-apple-ios target; the steps below install the rest.
+    runs-on: self-hosted
+    # Hours, not minutes: a cold tree cross-compiles QEMU, ANGLE, virglrenderer
+    # and MoltenVK before it ever reaches the app. A warm tree is minutes, and
+    # the 40 that halite-agent allows itself would kill the first run here.
+    timeout-minutes: 360
+
+    env:
+      PACKAGING: ${{ startsWith(github.ref, 'refs/tags/ios16-v') || inputs.release == true }}
+      # Read by build_ios.sh, build_angle_ios.sh (clamped to its own 16.4
+      # floor), build_moltenvk_ios.sh and build_rppairing_ios.sh. Exported to
+      # xcodebuild as a build setting too, so the app target follows without
+      # editing project.yml for a one-off experiment.
+      HUSK_MIN_IOS: ${{ inputs.deployment_target || '16.4' }}
+
+    steps:
+      # clean: false is load-bearing. On a self-hosted runner actions/checkout
+      # reuses the workspace and by default runs `git clean -ffdx`, which would
+      # delete build/, third_party/ and guests/ -- every one of them gitignored,
+      # and between them the cross-compiled QEMU, the WebKit sparse clone ANGLE
+      # comes from, MoltenVK's dependencies, and a 1.1 GB guest image. That is
+      # the entire several-hour build, discarded before each run, on a runner
+      # with no actions/cache to fall back on. The build scripts are all
+      # incremental and stamped, so keeping the tree is what makes a warm run
+      # take minutes.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      # Tracked files still need to match the commit even though the tree is
+      # kept. Checkout force-updates them, so this only reports -- a dirty
+      # tracked file here means something wrote into the workspace by hand.
+      - name: Show what survived from the last run
+        run: |
+          set -uo pipefail
+          git status --short || true
+          for d in build third_party guests; do
+            if [ -d "$d" ]; then
+              echo "warm: $d ($(du -sh "$d" 2>/dev/null | cut -f1))"
+            else
+              echo "cold: $d (will be built or fetched)"
+            fi
+          done
+
+      # Fail here, with numbers, rather than hours in with ENOSPC.
+      #
+      # This is not hypothetical: the first attempt at this build died at
+      # `brew install qemu` with "Errno::ENOSPC: No space left on device" on a
+      # runner with 3.0 GiB free of 75. ENOSPC surfaces wherever it happens to
+      # land -- a brew source build, a ninja link, an xcodebuild archive -- and
+      # the message names the tool rather than the disk, so it reads as a
+      # toolchain problem. A cold tree wants room for QEMU's source and build
+      # tree, the WebKit sparse clone ANGLE is built from plus its archive,
+      # MoltenVK's fetchDependencies building SPIRV-Cross, SPIRV-Tools and
+      # glslang, a Rust target directory and DerivedData.
+      - name: Check there is room to build
+        run: |
+          set -euo pipefail
+          free_gb=$(df -g . | awk 'NR==2 {print $4}')
+          if [ -d build ] && [ -d third_party ] && [ "${{ inputs.rebuild_deps }}" != "true" ]; then
+            need=5; what="warm tree"
+          else
+            need=25; what="cold tree"
+          fi
+          echo "$free_gb GiB free; a $what needs about $need GiB"
+          if [ "$free_gb" -lt "$need" ]; then
+            echo "::error::Only $free_gb GiB free and a $what needs ~$need GiB. Free space on the runner first."
+            echo "Largest consumers are usually simulator runtimes and old workspaces:"
+            xcrun simctl runtime list 2>/dev/null | tail -5 || true
+            du -sh "$HOME"/* 2>/dev/null | sort -rh | head -8 || true
+            exit 1
+          fi
+
+      # Newest, not pinned, for the same reason halite-agent gives: XcodeGen
+      # from Homebrew emits the current Xcode's project format, so pinning the
+      # toolchain while installing XcodeGen from brew is not a stable pair.
+      # Note this builds against whatever iOS SDK that Xcode carries and only
+      # the deployment target says iOS 16 -- which is the supported way round.
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          newest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "DEVELOPER_DIR=$newest/Contents/Developer" >> "$GITHUB_ENV"
+          echo "Using $newest"
+
+      # Homebrew is not on the runner's PATH on the Mac behind this workflow --
+      # a non-interactive shell there gets the bare system PATH, and brew is
+      # installed but invisible. Both prefixes are checked because that Mac is
+      # Intel (/usr/local); /opt/homebrew is the Apple Silicon one.
+      - name: Put Homebrew on PATH
+        run: |
+          set -euo pipefail
+          for p in /opt/homebrew /usr/local; do
+            if [ -x "$p/bin/brew" ]; then
+              echo "$p/bin" >> "$GITHUB_PATH"
+              echo "$p/sbin" >> "$GITHUB_PATH"
+              echo "Homebrew at $p"
+              exit 0
+            fi
+          done
+          echo "::error::no brew found in /opt/homebrew or /usr/local"
+          exit 1
+
+      # Everything scripts/ci_build.sh shells out to. qemu is here for qemu-img
+      # alone, which project.yml's Stage guest image script calls to create the
+      # two sparse qcow2 seeds; cmake is MoltenVK's fetchDependencies.
+      #
+      # Expect this to take about an hour the first time on the current runner,
+      # and seconds after that. Intel macOS 26 is a Homebrew Tier 3
+      # configuration, so there is no qemu bottle for it and brew builds it --
+      # and readline and cmake -- from source. It looks like a hung step and is
+      # not one. Nothing later depends on it except those two empty qcow2 files.
+      - name: Install tools
+        run: brew install xcodegen meson ninja pkg-config cmake qemu
+
+      # scripts/build_rppairing_ios.sh needs cargo with the iOS target. rustup is
+      # not preinstalled on the runner, so install it if it is absent rather
+      # than failing several minutes in at the one Rust step.
+      - name: Rust with the iOS target
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            echo "installing rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          # Either the fresh install or a pre-existing one.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-apple-ios
+          rustc --version
+
+      - name: Report the toolchain
+        run: |
+          set -uo pipefail
+          echo "deployment target : iOS $HUSK_MIN_IOS"
+          echo "xcode             : $(xcodebuild -version | head -1)"
+          echo "iphoneos SDK      : $(xcrun --sdk iphoneos --show-sdk-version)"
+          for t in xcodegen meson ninja pkg-config qemu-img cargo python3; do
+            printf '%-18s: %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+
+      # Asked for explicitly, because it throws away hours of work: the stamps
+      # in build/stamps are what make every later run incremental.
+      - name: Discard the dependency build
+        if: inputs.rebuild_deps == true
+        run: |
+          set -euo pipefail
+          echo "removing build/ -- QEMU, ANGLE, virglrenderer and MoltenVK will rebuild"
+          rm -rf build
+
+      # Fetches and cross-compiles QEMU, its five dependencies, ANGLE,
+      # libepoxy, virglrenderer, MoltenVK and the Rust pairing crate, then
+      # builds the app and writes the IPA. Every stage is stamped and skips
+      # itself when it is already done, so this is the cheap path on a warm
+      # tree and the expensive one exactly once.
+      - name: Build everything and package the IPA
+        run: |
+          set -euo pipefail
+          # xcodebuild takes build settings from the environment, so this
+          # reaches the app target without editing project.yml.
+          export IPHONEOS_DEPLOYMENT_TARGET="$HUSK_MIN_IOS"
+          ./scripts/ci_build.sh "$PWD/build/Husk.ipa"
+
+      # package_ipa.sh already refuses to ship a bundle that cannot install.
+      # This repeats the deployment-target half of it on its own, because it is
+      # the check that matters for an iOS 16 port and it is worth having in the
+      # log as a named step rather than buried in the build output.
+      - name: Check nothing deploys above iOS 16
+        run: |
+          set -euo pipefail
+          app="$(find /tmp/husk_ipa/Build/Products/Release-iphoneos -maxdepth 1 -name 'Husk.app' | head -1)"
+          if [ -z "$app" ]; then
+            echo "::warning::no built .app found; package_ipa.sh already ran its own check"
+            exit 0
+          fi
+          ./scripts/check_min_ios.sh "$app"
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/ios16-v* ]]; then
+            version="${GITHUB_REF#refs/tags/ios16-v}"
+          else
+            base="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+                      src/app/Husk/Info.plist 2>/dev/null || echo 0.0.0)"
+            version="${base}-ios16.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Husk $version"
+
+      # Unconditional: an IPA nobody can download is a green tick and nothing
+      # to install, and this is a port branch whose whole point is getting a
+      # file onto one specific phone.
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Husk-ios16-${{ steps.version.outputs.version }}
+          path: build/Husk.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish a prerelease
+        if: env.PACKAGING == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/ios16-v') && github.ref_name || format('ios16-v{0}', steps.version.outputs.version) }}
+          # The commit the build actually came from. Without this the action
+          # omits it and GitHub resolves the tag against the default branch --
+          # which here would tag main and ship a binary built from ios16.
+          target_commitish: ${{ github.sha }}
+          name: Husk ${{ steps.version.outputs.version }} (iOS 16)
+          prerelease: true
+          files: build/Husk.ipa
+          body: |
+            Husk built for **iOS ${{ env.HUSK_MIN_IOS }}** from the `ios16` branch.
+
+            JIT comes from the jailbreak's *Allow JIT in Apps*; Built-in StikJIT
+            is not in this build (it needs iOS 26). Install with TrollStore or a
+            rootless package manager so the entitlements in the binary survive.
+
+            Commit `${{ github.sha }}`.
+
+      - name: Upload the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            /tmp/husk_ipa/build.log
+            build/logs
+          if-no-files-found: ignore
+          retention-days: 7

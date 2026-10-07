@@ -44,7 +44,16 @@ if command -v xcodegen >/dev/null 2>&1; then
     echo "==> regenerating the project from project.yml"
     (cd "$HUSK_ROOT/src/app" && xcodegen generate --quiet)
 else
-    echo "==> xcodegen not installed; using the checked-in project as-is" >&2
+    # A warning on main, an error here. The checked-in .pbxproj predates this
+    # branch: it still carries the HuskJITHelper target with a 26.0 deployment
+    # target and the StikJIT.framework link, both of which project.yml has
+    # removed for iOS 16. Falling back to it would either fail in a way that
+    # looks like a code problem or, worse, succeed and ship the bundle this
+    # branch exists to avoid.
+    echo "error: xcodegen is required on this branch -- the checked-in" >&2
+    echo "       Husk.xcodeproj still has the iOS 26 JIT helper in it." >&2
+    echo "       brew install xcodegen" >&2
+    exit 1
 fi
 
 echo "==> building"
@@ -132,16 +141,34 @@ done
 
 # Built-in StikJIT's helper. Without it the app still installs and runs with
 # StikDebug, but its JIT setup would offer a method that can only fail.
-for f in "$APP/PlugIns/HuskJITHelper.appex/HuskJITHelper" \
-         "$APP/Frameworks/StikJIT.framework/StikJIT" \
-         "$APP/Frameworks/StikJIT.framework/Info.plist"; do
-    if [ ! -f "$f" ]; then
-        echo "  MISSING  ${f#$APP/}" >&2
-        rc=1
-    else
-        printf "  ok       %-28s %s\n" "$(basename "$f")" "${f#$APP/}"
-    fi
-done
+#
+# Off by default on the iOS 16 branch: project.yml here builds no HuskJITHelper
+# and embeds no StikJIT.framework, because Built-in StikJIT needs iOS 26. Left
+# on, these three checks would fail every single IPA this branch can produce.
+# Set HUSK_BUILTIN_JIT=1 if the helper is ever put back.
+if [ "${HUSK_BUILTIN_JIT:-0}" = "1" ]; then
+    for f in "$APP/PlugIns/HuskJITHelper.appex/HuskJITHelper" \
+             "$APP/Frameworks/StikJIT.framework/StikJIT" \
+             "$APP/Frameworks/StikJIT.framework/Info.plist"; do
+        if [ ! -f "$f" ]; then
+            echo "  MISSING  ${f#$APP/}" >&2
+            rc=1
+        else
+            printf "  ok       %-28s %s\n" "$(basename "$f")" "${f#$APP/}"
+        fi
+    done
+else
+    printf "  skip     %-28s %s\n" "Built-in StikJIT" "iOS 26 only; not in this build"
+fi
+
+# Every Mach-O in the bundle must deploy no higher than the app does. This is
+# the one class of iOS 16 breakage that builds, packages, installs and then
+# dies at launch with a dyld message naming a library rather than a version --
+# ANGLE in particular is built by a separate script with its own deployment
+# target, so a bump there is invisible until a 16.x device refuses it.
+if ! "$HUSK_ROOT/scripts/check_min_ios.sh" "$APP"; then
+    rc=1
+fi
 
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
 
